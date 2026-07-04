@@ -336,18 +336,37 @@ const fmt = (n) => `₱${(n || 0).toFixed(2)}`;
 // table AND the archiving logic, so a session snapshot always matches what was actually shown.
 // Court fee / shuttle fee are still computed (they feed Total) but intentionally not returned
 // as separate columns, per the request to hide them from the Bills table.
-function computeBillRows(players, shuttlePrice, courtFeePerHour) {
+// The single source of truth for "what does this player owe" — used by the live Bills table,
+// archiving, AND the expand-columns feature (which needs courtCost/shuttleCost individually,
+// not just their sum). Court fee / shuttle fee are always computed; whether they're SHOWN as
+// separate columns is a display choice made elsewhere, not something this function decides.
+function computeBillRows(players, shuttlePrice, courtFeePerHour, courtFeeMode, totalCourtFee) {
   const shuttlePriceNum = parseFloat(shuttlePrice) || 0;
-  const courtFeePerHourNum = parseFloat(courtFeePerHour) || 0;
-  const perGameCourtFee = courtFeePerHourNum / 3 / 4;
   const perGameShuttleFee = shuttlePriceNum / 4;
+
+  // Two different ways to work out each player's court fee, always rounded up to the nearest
+  // peso per player, per the house rule:
+  //  - "perGame": ÷3 games/hour ÷4 players = a rate per game, × how many games THIS player played.
+  //  - "sharing": one flat total fee, split evenly across everyone who played at least 1 game —
+  //    someone who played 4 games pays the same court share as someone who played 1.
+  let getCourtCost;
+  if (courtFeeMode === "sharing") {
+    const totalCourtFeeNum = parseFloat(totalCourtFee) || 0;
+    const participantCount = players.filter((p) => p.matchesToday >= 1).length;
+    const perPlayerShare = participantCount > 0 ? totalCourtFeeNum / participantCount : 0;
+    getCourtCost = (p) => (p.matchesToday >= 1 ? Math.ceil(perPlayerShare) : 0);
+  } else {
+    const perGameCourtFee = (parseFloat(courtFeePerHour) || 0) / 3 / 4;
+    getCourtCost = (p) => Math.ceil(perGameCourtFee * p.matchesToday);
+  }
+
   return players
     .map((p) => {
-      const courtCost = Math.ceil(perGameCourtFee * p.matchesToday);
+      const courtCost = getCourtCost(p);
       const shuttleCost = perGameShuttleFee * (p.shuttleGamesToday || 0);
       const misc = parseFloat(p.miscAdjustment) || 0;
       return {
-        id: p.id, name: p.name, games: p.matchesToday, misc, total: courtCost + shuttleCost + misc, paid: !!p.paidToday,
+        id: p.id, name: p.name, games: p.matchesToday, misc, courtCost, shuttleCost, total: courtCost + shuttleCost + misc, paid: !!p.paidToday,
         // raw stats kept only so an accidental archive can be undone later — not shown anywhere
         rawMatchesToday: p.matchesToday, rawShuttleGamesToday: p.shuttleGamesToday || 0, rawMiscAdjustment: p.miscAdjustment || "",
       };
@@ -378,13 +397,19 @@ function buildExportNode(title, columns, rows, colors) {
   return node;
 }
 // Standard column sets, reused by Bills (live + Previous Bills) and Ranking.
-const BILLS_COLUMNS = [
-  { label: "Player", render: (r) => escapeHtml(r.name) },
-  { label: "Games", render: (r) => r.games },
-  { label: "Misc", render: (r) => fmt(r.misc) },
-  { label: "Total", render: (r) => fmt(r.total), bold: true },
-  { label: "Paid", render: (r) => (r.paid ? '<span style="color:#2E9E4F; font-weight:700;">&#10004;</span>' : '<span style="color:#9A9A9A;">&mdash;</span>') },
-];
+function getBillsColumns(expanded) {
+  return [
+    { label: "Player", render: (r) => escapeHtml(r.name) },
+    { label: "Games", render: (r) => r.games },
+    { label: "Misc", render: (r) => fmt(r.misc) },
+    ...(expanded ? [
+      { label: "Court fee", render: (r) => fmt(r.courtCost) },
+      { label: "Shuttle fee", render: (r) => fmt(r.shuttleCost) },
+    ] : []),
+    { label: "Total", render: (r) => fmt(r.total), bold: true },
+    { label: "Paid", render: (r) => (r.paid ? '<span style="color:#2E9E4F; font-weight:700;">&#10004;</span>' : '<span style="color:#9A9A9A;">&mdash;</span>') },
+  ];
+}
 function rankingColumns(subTab) {
   const base = [{ label: "#", render: (r, i) => i + 1 }, { label: "Player", render: (r) => escapeHtml(r.name) }];
   if (subTab === "wins") return [...base, { label: "Wins", render: (r) => r.wins }, { label: "Score diff", render: (r) => `${r.scoreDiff >= 0 ? "+" : ""}${r.scoreDiff}`, bold: true }];
@@ -546,6 +571,8 @@ function App() {
   const [history, setHistory] = useState([]);
   const [shuttlePrice, setShuttlePriceState] = useState("");
   const [courtFeePerHour, setCourtFeePerHourState] = useState("");
+  const [courtFeeMode, setCourtFeeMode] = useState("perGame"); // 'perGame' | 'sharing'
+  const [totalCourtFee, setTotalCourtFeeState] = useState("");
   const [geminiKeys, setGeminiKeys] = useState(["", "", ""]);
   const [geminiKeyIndex, setGeminiKeyIndex] = useState(0);
   const geminiKey = geminiKeys[geminiKeyIndex] || "";
@@ -578,7 +605,7 @@ function App() {
       let h = await loadKey("bq_history", []);
       let meta = await loadKey("bq_meta", { lastResetAt: null });
       let archives = await loadKey("bq_archivedSessions", []);
-      let settings = await loadKey("bq_settings", { shuttlePrice: 0, courtFeePerHour: 0 });
+      let settings = await loadKey("bq_settings", { shuttlePrice: 0, courtFeePerHour: 0, courtFeeMode: "perGame", totalCourtFee: 0 });
       let gKeys = await loadKey("bq_geminiKeys", ["", "", ""]);
       let gIdx = await loadKey("bq_geminiKeyIndex", 0);
       let appearance = await loadKey("bq_appearance", { theme: "green", font: "manrope", fontSize: "medium" });
@@ -589,6 +616,8 @@ function App() {
 
       setPlayers(p); setQueue(q); setCourts(c); setPendingMatches(pend); setPlayedGroups(groups); setHistory(h);
       setShuttlePriceState(settings.shuttlePrice !== undefined && String(settings.shuttlePrice) !== "0" ? String(settings.shuttlePrice) : ""); setCourtFeePerHourState(settings.courtFeePerHour !== undefined && String(settings.courtFeePerHour) !== "0" ? String(settings.courtFeePerHour) : "");
+      setCourtFeeMode(settings.courtFeeMode === "sharing" ? "sharing" : "perGame");
+      setTotalCourtFeeState(settings.totalCourtFee !== undefined && String(settings.totalCourtFee) !== "0" ? String(settings.totalCourtFee) : "");
       setGeminiKeys(Array.isArray(gKeys) && gKeys.length === 3 ? gKeys : ["", "", ""]);
       setGeminiKeyIndex(Number.isInteger(gIdx) && gIdx >= 0 && gIdx < 3 ? gIdx : 0);
       setTheme(THEMES[appearance.theme] ? appearance.theme : "green");
@@ -606,7 +635,7 @@ function App() {
   useEffect(() => { if (loaded) saveKey("bq_pending", pendingMatches); }, [pendingMatches, loaded]);
   useEffect(() => { if (loaded) saveKey("bq_playedGroups", playedGroups); }, [playedGroups, loaded]);
   useEffect(() => { if (loaded) saveKey("bq_history", history); }, [history, loaded]);
-  useEffect(() => { if (loaded) saveKey("bq_settings", { shuttlePrice, courtFeePerHour }); }, [shuttlePrice, courtFeePerHour, loaded]);
+  useEffect(() => { if (loaded) saveKey("bq_settings", { shuttlePrice, courtFeePerHour, courtFeeMode, totalCourtFee }); }, [shuttlePrice, courtFeePerHour, courtFeeMode, totalCourtFee, loaded]);
   useEffect(() => { if (loaded) saveKey("bq_archivedSessions", archivedSessions); }, [archivedSessions, loaded]);
   useEffect(() => { if (loaded) saveKey("bq_geminiKeys", geminiKeys); }, [geminiKeys, loaded]);
   useEffect(() => { if (loaded) saveKey("bq_geminiKeyIndex", geminiKeyIndex); }, [geminiKeyIndex, loaded]);
@@ -614,6 +643,7 @@ function App() {
 
   const setShuttlePrice = (v) => setShuttlePriceState(sanitizeNumeric(v, false));
   const setCourtFeePerHour = (v) => setCourtFeePerHourState(sanitizeNumeric(v, false));
+  const setTotalCourtFee = (v) => setTotalCourtFeeState(sanitizeNumeric(v, false));
   const setPlayerMisc = (id, value) => setPlayers((prev) => prev.map((p) => (p.id === id ? { ...p, miscAdjustment: sanitizeNumeric(value, true) } : p)));
   const togglePaid = (id) => setPlayers((prev) => prev.map((p) => (p.id === id ? { ...p, paidToday: !p.paidToday } : p)));
 
@@ -639,7 +669,7 @@ function App() {
   // Snapshots the current Bills into the archive (max 8, oldest dropped) if there's anything
   // worth keeping. Returns the archive entry, or null if there was nothing to archive.
   const archiveSession = (source) => {
-    const rows = computeBillRows(players, shuttlePrice, courtFeePerHour);
+    const rows = computeBillRows(players, shuttlePrice, courtFeePerHour, courtFeeMode, totalCourtFee);
     if (rows.length === 0) return null;
     const now = Date.now();
     const entry = {
@@ -1108,6 +1138,7 @@ Respond with ONLY raw JSON, no markdown fences, no commentary, in exactly this s
         {tab === "payment" && (
           <PaymentTab
             players={players} shuttlePrice={shuttlePrice} setShuttlePrice={setShuttlePrice} courtFeePerHour={courtFeePerHour} setCourtFeePerHour={setCourtFeePerHour}
+            courtFeeMode={courtFeeMode} setCourtFeeMode={setCourtFeeMode} totalCourtFee={totalCourtFee} setTotalCourtFee={setTotalCourtFee}
             setPlayerMisc={setPlayerMisc} togglePaid={togglePaid} colors={exportColors}
             onOpenPreviousBills={() => setPreviousBillsOpen(true)} onArchiveNow={() => setArchiveNowConfirmOpen(true)}
           />
@@ -1160,7 +1191,7 @@ Respond with ONLY raw JSON, no markdown fences, no commentary, in exactly this s
           onClose={() => setPreviousBillsOpen(false)}
           onTogglePaid={toggleArchivedPaid}
           onUndo={(id) => { undoLastArchive(id); setPreviousBillsOpen(false); }}
-          onExport={(rows, label) => shareImage(label, BILLS_COLUMNS, rows, exportColors)}
+          onExport={(rows, label, expanded) => shareImage(label, getBillsColumns(expanded), rows, exportColors)}
         />
       )}
 
@@ -1656,12 +1687,18 @@ function ArchiveNowModal({ onClose, onConfirm }) {
 }
 function PreviousBillsModal({ archivedSessions, colors, onClose, onTogglePaid, onUndo, onExport }) {
   const [activeIdx, setActiveIdx] = useState(0);
+  const [expanded, setExpanded] = useState(false);
   const active = archivedSessions[activeIdx];
   const isNewest = activeIdx === 0;
   return (
     <div className="bq-modal-overlay" onClick={onClose}>
       <div className="bq-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 560 }}>
-        <div className="bq-modal-head"><h3><Clock size={17} /> Previous bills</h3><button className="bq-icon-btn" onClick={onClose}><X size={18} /></button></div>
+        <div className="bq-modal-head">
+          <h3><Clock size={17} /> Previous bills{active && (
+            <button className="bq-expand-btn" onClick={() => setExpanded((e) => !e)} title={expanded ? "Collapse: hide Court fee & Shuttle fee columns" : "Expand: show Court fee & Shuttle fee columns"}>{expanded ? "−" : "+"}</button>
+          )}</h3>
+          <button className="bq-icon-btn" onClick={onClose}><X size={18} /></button>
+        </div>
         <div className="bq-modal-body">
           {archivedSessions.length === 0 ? (
             <p className="bq-empty">No archived sessions yet — Reset Data or Archive Now will save one here.</p>
@@ -1676,13 +1713,20 @@ function PreviousBillsModal({ archivedSessions, colors, onClose, onTogglePaid, o
                 <>
                   <div className="bq-pay-table-scroll">
                     <table className="bq-pay-table">
-                      <thead><tr><th>Player</th><th>Games</th><th>Misc</th><th>Total</th><th>Paid</th></tr></thead>
+                      <thead>
+                        <tr>
+                          <th>Player</th><th>Games</th><th>Misc</th>
+                          {expanded && <><th>Court fee</th><th>Shuttle fee</th></>}
+                          <th>Total</th><th>Paid</th>
+                        </tr>
+                      </thead>
                       <tbody>
                         {active.rows.map((r) => (
                           <tr key={r.id}>
                             <td>{r.name}</td>
                             <td className="bq-mono">{r.games}</td>
                             <td className="bq-mono">{fmt(r.misc)}</td>
+                            {expanded && <><td className="bq-mono">{fmt(r.courtCost || 0)}</td><td className="bq-mono">{fmt(r.shuttleCost || 0)}</td></>}
                             <td className="bq-mono bq-pay-total-cell">{fmt(r.total)}</td>
                             <td>
                               <label className="bq-paid-check">
@@ -1698,7 +1742,7 @@ function PreviousBillsModal({ archivedSessions, colors, onClose, onTogglePaid, o
                     {isNewest ? (
                       <button className="bq-btn bq-btn-ghost" onClick={() => onUndo(active.id)}>Undo — restore to live Bills</button>
                     ) : <span />}
-                    <button className="bq-btn bq-btn-primary" onClick={() => onExport(active.rows, active.label)}>Share</button>
+                    <button className="bq-btn bq-btn-primary" onClick={() => onExport(active.rows, active.label, expanded)}>Share</button>
                   </div>
                 </>
               )}
@@ -1927,15 +1971,23 @@ function RankingTab({ players, history }) {
 /*  Payment tab                                                            */
 /* ---------------------------------------------------------------------- */
 
-function PaymentTab({ players, shuttlePrice, setShuttlePrice, courtFeePerHour, setCourtFeePerHour, setPlayerMisc, togglePaid, colors, onOpenPreviousBills, onArchiveNow }) {
+function PaymentTab({ players, shuttlePrice, setShuttlePrice, courtFeePerHour, setCourtFeePerHour, courtFeeMode, setCourtFeeMode, totalCourtFee, setTotalCourtFee, setPlayerMisc, togglePaid, colors, onOpenPreviousBills, onArchiveNow }) {
+  const [expanded, setExpanded] = useState(false);
   const perGameCourtFee = (parseFloat(courtFeePerHour) || 0) / 3 / 4;
-  const rows = computeBillRows(players, shuttlePrice, courtFeePerHour);
-  const grand = rows.reduce((acc, r) => ({ misc: acc.misc + r.misc, total: acc.total + r.total }), { misc: 0, total: 0 });
+  const participantCount = players.filter((p) => p.matchesToday >= 1).length;
+  const perPlayerShare = participantCount > 0 ? (parseFloat(totalCourtFee) || 0) / participantCount : 0;
+  const rows = computeBillRows(players, shuttlePrice, courtFeePerHour, courtFeeMode, totalCourtFee);
+  const grand = rows.reduce((acc, r) => ({ court: acc.court + r.courtCost, shuttle: acc.shuttle + r.shuttleCost, misc: acc.misc + r.misc, total: acc.total + r.total }), { court: 0, shuttle: 0, misc: 0, total: 0 });
+  const columns = getBillsColumns(expanded);
 
   return (
     <div className="bq-payment">
       <div className="bq-payment-settings">
         <h2>Rates</h2>
+        <div className="bq-chip-row" style={{ marginBottom: 12 }}>
+          <button className={`bq-chip ${courtFeeMode === "perGame" ? "bq-chip-active" : ""}`} onClick={() => setCourtFeeMode("perGame")}>Pay per game</button>
+          <button className={`bq-chip ${courtFeeMode === "sharing" ? "bq-chip-active" : ""}`} onClick={() => setCourtFeeMode("sharing")}>Court sharing</button>
+        </div>
         <div className="bq-pay-settings-grid">
           <label className="bq-pay-field">
             <span>Shuttlecock price <InfoTip text="Split 4 ways, charged to a player only for games where the court's &quot;New shuttlecock&quot; box was ticked." /></span>
@@ -1944,20 +1996,33 @@ function PaymentTab({ players, shuttlePrice, setShuttlePrice, courtFeePerHour, s
               <input type="text" inputMode="decimal" placeholder="0.00" className="bq-input" value={shuttlePrice} onChange={(e) => setShuttlePrice(e.target.value)} />
             </div>
           </label>
-          <label className="bq-pay-field">
-            <span>Court fee per hour <InfoTip text={`÷ 3 games/hour ÷ 4 players = ${fmt(perGameCourtFee)} per player per game, rounded up to the next peso in the table.`} /></span>
-            <div className="bq-pay-input-wrap">
-              <span>₱</span>
-              <input type="text" inputMode="decimal" placeholder="0.00" className="bq-input" value={courtFeePerHour} onChange={(e) => setCourtFeePerHour(e.target.value)} />
-            </div>
-          </label>
+          {courtFeeMode === "perGame" ? (
+            <label className="bq-pay-field">
+              <span>Court fee per hour <InfoTip text={`÷ 3 games/hour ÷ 4 players = ${fmt(perGameCourtFee)} per player per game, rounded up to the next peso in the table.`} /></span>
+              <div className="bq-pay-input-wrap">
+                <span>₱</span>
+                <input type="text" inputMode="decimal" placeholder="0.00" className="bq-input" value={courtFeePerHour} onChange={(e) => setCourtFeePerHour(e.target.value)} />
+              </div>
+            </label>
+          ) : (
+            <label className="bq-pay-field">
+              <span>Total court fee <InfoTip text={`Split evenly across everyone who played at least 1 game today (${participantCount} player${participantCount !== 1 ? "s" : ""} right now) = ${fmt(perPlayerShare)} each, rounded up to the next peso. Someone who played 4 games pays the same share as someone who played 1.`} /></span>
+              <div className="bq-pay-input-wrap">
+                <span>₱</span>
+                <input type="text" inputMode="decimal" placeholder="0.00" className="bq-input" value={totalCourtFee} onChange={(e) => setTotalCourtFee(e.target.value)} />
+              </div>
+            </label>
+          )}
         </div>
       </div>
 
       <div className="bq-pay-table-wrap">
         <div className="bq-pay-heading-row">
-          <h2>Bills <span className="bq-muted-sm">({rows.length} players)</span> <InfoTip text="Use the Misc column to add a one-off charge (+) or credit (−) for any individual player. Only players with a nonzero total are shown." /></h2>
-          <button className="bq-btn bq-btn-ghost" onClick={() => shareImage("Bills", BILLS_COLUMNS, rows, colors)} disabled={rows.length === 0}>Share</button>
+          <h2>
+            Bills <span className="bq-muted-sm">({rows.length} players)</span> <InfoTip text="Use the Misc column to add a one-off charge (+) or credit (−) for any individual player. Only players with a nonzero total are shown." />
+            <button className="bq-expand-btn" onClick={() => setExpanded((e) => !e)} title={expanded ? "Collapse: hide Court fee & Shuttle fee columns" : "Expand: show Court fee & Shuttle fee columns"}>{expanded ? "−" : "+"}</button>
+          </h2>
+          <button className="bq-btn bq-btn-ghost" onClick={() => shareImage("Bills", columns, rows, colors)} disabled={rows.length === 0}>Share</button>
         </div>
         {rows.length === 0 ? (
           <p className="bq-empty">No players with a bill yet.</p>
@@ -1965,7 +2030,11 @@ function PaymentTab({ players, shuttlePrice, setShuttlePrice, courtFeePerHour, s
           <div className="bq-pay-table-scroll">
           <table className="bq-pay-table">
             <thead>
-              <tr><th>Player</th><th>Games</th><th>Misc (+/−)</th><th>Total</th><th>Paid</th></tr>
+              <tr>
+                <th>Player</th><th>Games</th><th>Misc (+/−)</th>
+                {expanded && <><th>Court fee</th><th>Shuttle fee</th></>}
+                <th>Total</th><th>Paid</th>
+              </tr>
             </thead>
             <tbody>
               {rows.map((r) => (
@@ -1980,6 +2049,7 @@ function PaymentTab({ players, shuttlePrice, setShuttlePrice, courtFeePerHour, s
                       title="Add a charge (positive) or credit (negative) for this player"
                     />
                   </td>
+                  {expanded && <><td className="bq-mono">{fmt(r.courtCost)}</td><td className="bq-mono">{fmt(r.shuttleCost)}</td></>}
                   <td className="bq-mono bq-pay-total-cell">{fmt(r.total)}</td>
                   <td>
                     <label className="bq-paid-check">
@@ -1993,6 +2063,7 @@ function PaymentTab({ players, shuttlePrice, setShuttlePrice, courtFeePerHour, s
               <tr>
                 <td colSpan={2}>Grand total</td>
                 <td className="bq-mono">{fmt(grand.misc)}</td>
+                {expanded && <><td className="bq-mono">{fmt(grand.court)}</td><td className="bq-mono">{fmt(grand.shuttle)}</td></>}
                 <td className="bq-mono bq-pay-total-cell">{fmt(grand.total)}</td>
                 <td></td>
               </tr>
@@ -2188,6 +2259,8 @@ function Styles({ fontFamily }) {
       .bq-paid-check input { accent-color: ${COLORS.accent}; width: 16px; height: 16px; cursor: pointer; }
       .bq-pay-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 14px; padding-top: 12px; border-top: 1px solid #E7E2D3; flex-wrap: wrap; }
       .bq-link-btn { background: none; border: none; color: ${COLORS.accent}; font-size: 12.5px; font-weight: 700; text-decoration: underline; cursor: pointer; padding: 4px 0; }
+      .bq-expand-btn { width: 20px; height: 20px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; background: ${COLORS.card}; border: 1px solid ${COLORS.accent}; border-radius: 4px; color: ${COLORS.accent}; font-size: 13px; font-weight: 700; line-height: 1; cursor: pointer; text-transform: none; }
+      .bq-expand-btn:hover { background: ${COLORS.accent}; color: ${COLORS.cream}; }
 
       .bq-match { z-index: 1; display: flex; flex-direction: column; gap: 10px; flex: 1; }
       .bq-category-chip { display: inline-block; align-self: flex-start; font-size: 10.5px; font-weight: 700; padding: 3px 9px; border-radius: 20px; border: 1px solid; text-transform: uppercase; letter-spacing: 0.02em; }
