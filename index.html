@@ -13,6 +13,7 @@
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
 </head>
 <body>
 <div id="root"><div id="boot-fallback">Loading Undercover Pa-queue…</div></div>
@@ -330,6 +331,97 @@ function computeRankings(history, players) {
   });
   return players.map((p) => ({ ...p, ...stats[p.id] })).filter((p) => p.matches > 0);
 }
+const fmt = (n) => `₱${(n || 0).toFixed(2)}`;
+// The single source of truth for "what does this player owe" — used by both the live Bills
+// table AND the archiving logic, so a session snapshot always matches what was actually shown.
+// Court fee / shuttle fee are still computed (they feed Total) but intentionally not returned
+// as separate columns, per the request to hide them from the Bills table.
+function computeBillRows(players, shuttlePrice, courtFeePerHour) {
+  const shuttlePriceNum = parseFloat(shuttlePrice) || 0;
+  const courtFeePerHourNum = parseFloat(courtFeePerHour) || 0;
+  const perGameCourtFee = courtFeePerHourNum / 3 / 4;
+  const perGameShuttleFee = shuttlePriceNum / 4;
+  return players
+    .map((p) => {
+      const courtCost = Math.ceil(perGameCourtFee * p.matchesToday);
+      const shuttleCost = perGameShuttleFee * (p.shuttleGamesToday || 0);
+      const misc = parseFloat(p.miscAdjustment) || 0;
+      return {
+        id: p.id, name: p.name, games: p.matchesToday, misc, total: courtCost + shuttleCost + misc, paid: !!p.paidToday,
+        // raw stats kept only so an accidental archive can be undone later — not shown anywhere
+        rawMatchesToday: p.matchesToday, rawShuttleGamesToday: p.shuttleGamesToday || 0, rawMiscAdjustment: p.miscAdjustment || "",
+      };
+    })
+    .filter((r) => r.total !== 0)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+// Builds a plain HTML table off-screen (not visible to the user), styled to match whichever
+// theme is currently active, screenshots it with html2canvas, then triggers a PNG download.
+// Off-screen (not display:none) is required — html2canvas can only capture elements that are
+// actually laid out on the page.
+// Builds a themed off-screen HTML table for the given columns/rows — reused for both Bills and
+// Ranking exports, since both are "a table of stats," just with different columns.
+function buildExportNode(title, columns, rows, colors) {
+  const node = document.createElement("div");
+  node.style.cssText = `position:fixed; top:-9999px; left:0; width:420px; font-family:'Manrope',sans-serif; background:${colors.cream};`;
+  const headCells = columns.map((c) => `<td style="padding:8px 12px; font-size:10px; font-weight:700; text-transform:uppercase; color:${colors.muted};">${escapeHtml(c.label)}</td>`).join("");
+  const bodyRows = rows.length
+    ? rows.map((r, i) => `<tr style="border-top:1px solid #00000014;">${columns.map((c) => `<td style="padding:9px 12px; font-size:${c.bold ? "12px" : "13px"}; font-family:${c.bold ? "'IBM Plex Mono',monospace" : "'Manrope',sans-serif"}; font-weight:${c.bold ? 700 : 400}; color:${c.bold ? colors.accent : colors.ink};">${c.render(r, i)}</td>`).join("")}</tr>`).join("")
+    : `<tr><td colspan="${columns.length}" style="padding:14px 12px; color:${colors.muted}; font-size:12px;">No data to show.</td></tr>`;
+  node.innerHTML = `
+    <div style="background:${colors.headerBg}; color:${colors.headerText}; padding:14px 16px; font-weight:700; font-size:15px; font-family:'Oswald',sans-serif; text-transform:uppercase;">Undercover Pa-queue &mdash; ${escapeHtml(title)}</div>
+    <table style="width:100%; border-collapse:collapse;">
+      <thead><tr style="background:${colors.card};">${headCells}</tr></thead>
+      <tbody>${bodyRows}</tbody>
+    </table>`;
+  return node;
+}
+// Standard column sets, reused by Bills (live + Previous Bills) and Ranking.
+const BILLS_COLUMNS = [
+  { label: "Player", render: (r) => escapeHtml(r.name) },
+  { label: "Games", render: (r) => r.games },
+  { label: "Misc", render: (r) => fmt(r.misc) },
+  { label: "Total", render: (r) => fmt(r.total), bold: true },
+  { label: "Paid", render: (r) => (r.paid ? '<span style="color:#2E9E4F; font-weight:700;">&#10004;</span>' : '<span style="color:#9A9A9A;">&mdash;</span>') },
+];
+function rankingColumns(subTab) {
+  const base = [{ label: "#", render: (r, i) => i + 1 }, { label: "Player", render: (r) => escapeHtml(r.name) }];
+  if (subTab === "wins") return [...base, { label: "Wins", render: (r) => r.wins }, { label: "Score diff", render: (r) => `${r.scoreDiff >= 0 ? "+" : ""}${r.scoreDiff}`, bold: true }];
+  if (subTab === "points") return [...base, { label: "Points", render: (r) => r.points }, { label: "Matches", render: (r) => r.matches, bold: true }];
+  return [...base, { label: "Win%", render: (r) => `${Math.round((r.wins / r.matches) * 100)}%` }, { label: "Score diff", render: (r) => `${r.scoreDiff >= 0 ? "+" : ""}${r.scoreDiff}`, bold: true }];
+}
+// Renders the table to a PNG, then hands it to the device's native share sheet if the browser
+// supports sharing files (mobile browsers, generally) — letting the person pick Messenger,
+// Telegram, Instagram, etc. themselves. Falls back to a plain download everywhere else (desktop
+// browsers can't share files this way at all) or if the person cancels the share sheet.
+async function shareImage(title, columns, rows, colors) {
+  const node = buildExportNode(title, columns, rows, colors);
+  document.body.appendChild(node);
+  let canvas;
+  try {
+    canvas = await window.html2canvas(node, { backgroundColor: colors.cream, scale: 2 });
+  } finally {
+    document.body.removeChild(node);
+  }
+  const fileName = `${title.replace(/[^a-z0-9]/gi, "_")}.png`;
+  try {
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+    const file = new File([blob], fileName, { type: "image/png" });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title });
+        return;
+      } catch (err) {
+        if (err && err.name === "AbortError") return; // person cancelled the share sheet — not an error
+      }
+    }
+  } catch (e) { /* fall through to download */ }
+  const link = document.createElement("a");
+  link.download = fileName;
+  link.href = canvas.toDataURL("image/png");
+  link.click();
+}
 
 /* ---------------------------------------------------------------------- */
 /*  Storage helpers (personal, per-user)                                   */
@@ -347,10 +439,11 @@ async function saveKey(key, value) {
 /* ---------------------------------------------------------------------- */
 /*  Small UI atoms                                                         */
 /* ---------------------------------------------------------------------- */
-function LevelBadge({ level }) {
+function LevelBadge({ level, abbreviate }) {
   const COLORS = useThemeColors();
   const LEVEL_COLOR = { Beginner: COLORS.beginner, Intermediate: COLORS.intermediate, "Upper Intermediate": COLORS.upperIntermediate, Advance: COLORS.advance };
-  return <span style={{ background: `${LEVEL_COLOR[level]}1A`, color: LEVEL_COLOR[level], border: `1px solid ${LEVEL_COLOR[level]}55` }} className="bq-badge">{level}</span>;
+  const display = abbreviate && level === "Upper Intermediate" ? "Upper Int." : level;
+  return <span style={{ background: `${LEVEL_COLOR[level]}1A`, color: LEVEL_COLOR[level], border: `1px solid ${LEVEL_COLOR[level]}55` }} className="bq-badge">{display}</span>;
 }
 function GenderDot({ gender }) {
   const COLORS = useThemeColors();
@@ -365,7 +458,7 @@ function CategoryChip({ category }) {
   const c = CATEGORY_COLOR[category] || COLORS.muted;
   return <span className="bq-category-chip" style={{ background: `${c}1F`, color: c, borderColor: `${c}55` }}>{category || "No standard category"}</span>;
 }
-function TeamBlock({ ids, playersById }) {
+function TeamBlock({ ids, playersById, abbreviate }) {
   return (
     <div className="bq-team">
       {ids.map((id) => {
@@ -374,7 +467,7 @@ function TeamBlock({ ids, playersById }) {
         return (
           <div key={id} className="bq-team-player">
             <Avatar name={p.name} size={30} />
-            <div><div className="bq-team-name">{p.name}</div><LevelBadge level={p.level} /></div>
+            <div><div className="bq-team-name">{p.name}</div><LevelBadge level={p.level} abbreviate={abbreviate} /></div>
           </div>
         );
       })}
@@ -417,6 +510,28 @@ function Tooltip({ text, children }) {
     </span>
   );
 }
+// A small (i) icon that toggles a text explanation on click/tap — works identically on desktop
+// and mobile (no hover or long-press needed), and the bubble wraps text instead of staying on
+// one line, since explanations tend to be longer than a button's quick-glance tooltip.
+function InfoTip({ text }) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = React.useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    const onOutside = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", onOutside);
+    document.addEventListener("touchstart", onOutside);
+    return () => { document.removeEventListener("mousedown", onOutside); document.removeEventListener("touchstart", onOutside); };
+  }, [open]);
+  return (
+    <span className="bq-infotip-wrap" ref={wrapRef}>
+      <button type="button" className="bq-infotip-btn" onClick={() => setOpen((o) => !o)} aria-label="More info">
+        <Info size={13} />
+      </button>
+      {open && <span className="bq-infotip-bubble" role="tooltip">{text}</span>}
+    </span>
+  );
+}
 
 /* ---------------------------------------------------------------------- */
 /*  Main App                                                                */
@@ -442,6 +557,10 @@ function App() {
   const [manualOpen, setManualOpen] = useState(false);
   const [lastResetAt, setLastResetAt] = useState(null);
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
+  const [archivedSessions, setArchivedSessions] = useState([]);
+  const [archiveNowConfirmOpen, setArchiveNowConfirmOpen] = useState(false);
+  const [pendingNewDayMatch, setPendingNewDayMatch] = useState(null); // courtId awaiting the archive-first confirm
+  const [previousBillsOpen, setPreviousBillsOpen] = useState(false);
 
   const playersById = Object.fromEntries(players.map((p) => [p.id, p]));
 
@@ -458,13 +577,14 @@ function App() {
       let groups = await loadKey("bq_playedGroups", []);
       let h = await loadKey("bq_history", []);
       let meta = await loadKey("bq_meta", { lastResetAt: null });
+      let archives = await loadKey("bq_archivedSessions", []);
       let settings = await loadKey("bq_settings", { shuttlePrice: 0, courtFeePerHour: 0 });
       let gKeys = await loadKey("bq_geminiKeys", ["", "", ""]);
       let gIdx = await loadKey("bq_geminiKeyIndex", 0);
       let appearance = await loadKey("bq_appearance", { theme: "green", font: "manrope", fontSize: "medium" });
 
-      if (p === null) p = DEMO_PLAYERS.map((d) => ({ id: uid("pl"), ...d, matchesToday: 0, sitOutStreak: 0, shuttleGamesToday: 0, miscAdjustment: "" }));
-      p = p.map((pl) => ({ ...pl, sitOutStreak: pl.sitOutStreak ?? 0, shuttleGamesToday: pl.shuttleGamesToday ?? 0, miscAdjustment: pl.miscAdjustment !== undefined && String(pl.miscAdjustment) !== "0" ? String(pl.miscAdjustment) : "" }));
+      if (p === null) p = DEMO_PLAYERS.map((d) => ({ id: uid("pl"), ...d, matchesToday: 0, sitOutStreak: 0, shuttleGamesToday: 0, miscAdjustment: "", paidToday: false }));
+      p = p.map((pl) => ({ ...pl, sitOutStreak: pl.sitOutStreak ?? 0, shuttleGamesToday: pl.shuttleGamesToday ?? 0, miscAdjustment: pl.miscAdjustment !== undefined && String(pl.miscAdjustment) !== "0" ? String(pl.miscAdjustment) : "", paidToday: pl.paidToday ?? false }));
       c = c.map((court) => ({ ...court, needsShuttle: court.needsShuttle ?? false }));
 
       setPlayers(p); setQueue(q); setCourts(c); setPendingMatches(pend); setPlayedGroups(groups); setHistory(h);
@@ -475,6 +595,7 @@ function App() {
       setFontChoice(FONT_OPTIONS[appearance.font] ? appearance.font : "manrope");
       setFontSizeChoice(FONT_SIZES[appearance.fontSize] ? appearance.fontSize : "medium");
       setLastResetAt(meta.lastResetAt || null);
+      setArchivedSessions(Array.isArray(archives) ? archives : []);
       setLoaded(true);
     })();
   }, []);
@@ -486,6 +607,7 @@ function App() {
   useEffect(() => { if (loaded) saveKey("bq_playedGroups", playedGroups); }, [playedGroups, loaded]);
   useEffect(() => { if (loaded) saveKey("bq_history", history); }, [history, loaded]);
   useEffect(() => { if (loaded) saveKey("bq_settings", { shuttlePrice, courtFeePerHour }); }, [shuttlePrice, courtFeePerHour, loaded]);
+  useEffect(() => { if (loaded) saveKey("bq_archivedSessions", archivedSessions); }, [archivedSessions, loaded]);
   useEffect(() => { if (loaded) saveKey("bq_geminiKeys", geminiKeys); }, [geminiKeys, loaded]);
   useEffect(() => { if (loaded) saveKey("bq_geminiKeyIndex", geminiKeyIndex); }, [geminiKeyIndex, loaded]);
   useEffect(() => { if (loaded) saveKey("bq_appearance", { theme, font: fontChoice, fontSize: fontSizeChoice }); }, [theme, fontChoice, fontSizeChoice, loaded]);
@@ -493,6 +615,7 @@ function App() {
   const setShuttlePrice = (v) => setShuttlePriceState(sanitizeNumeric(v, false));
   const setCourtFeePerHour = (v) => setCourtFeePerHourState(sanitizeNumeric(v, false));
   const setPlayerMisc = (id, value) => setPlayers((prev) => prev.map((p) => (p.id === id ? { ...p, miscAdjustment: sanitizeNumeric(value, true) } : p)));
+  const togglePaid = (id) => setPlayers((prev) => prev.map((p) => (p.id === id ? { ...p, paidToday: !p.paidToday } : p)));
 
   const deleteHistoryEntry = (id) => {
     setHistory((prev) => {
@@ -513,22 +636,71 @@ function App() {
   useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(null), 3400); return () => clearTimeout(t); }, [toast]);
   const notify = (msg, kind = "info") => setToast({ msg, kind });
 
-  // Manual, explicitly-confirmed reset ("Reset Data"). Wipes all match-day state — history,
-  // scores, queue, pending matches, live court matches, played-together tracking, and every
-  // player's counters — but keeps the roster itself and all Settings (theme/font/Gemini keys).
-  const resetDay = () => {
+  // Snapshots the current Bills into the archive (max 8, oldest dropped) if there's anything
+  // worth keeping. Returns the archive entry, or null if there was nothing to archive.
+  const archiveSession = (source) => {
+    const rows = computeBillRows(players, shuttlePrice, courtFeePerHour);
+    if (rows.length === 0) return null;
+    const now = Date.now();
+    const entry = {
+      id: uid("archive"),
+      label: new Date(now).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }),
+      createdAt: now,
+      source, // 'reset' | 'manual' | 'auto' — informational only
+      rows,
+    };
+    setArchivedSessions((prev) => [entry, ...prev].slice(0, 8));
+    return entry;
+  };
+  // The actual "wipe the live day" step, shared by every trigger — separated from archiving so
+  // callers can decide whether/when to archive first.
+  const wipeDayData = () => {
     setPendingMatches([]);
     setPlayedGroups([]);
     setQueue([]);
     setHistory([]);
     setCourts((prev) => prev.map((c) => ({ ...c, match: null, needsShuttle: false })));
-    setPlayers((prev) => prev.map((p) => ({ ...p, matchesToday: 0, sitOutStreak: 0, shuttleGamesToday: 0, miscAdjustment: "" })));
+    setPlayers((prev) => prev.map((p) => ({ ...p, matchesToday: 0, sitOutStreak: 0, shuttleGamesToday: 0, miscAdjustment: "", paidToday: false })));
     const now = Date.now();
     setLastResetAt(now);
     saveKey("bq_meta", { lastResetAt: now });
-    setResetConfirmOpen(false);
-    notify("Data reset — everything except the roster has been cleared.", "success");
   };
+  // "Reset Data" — archives first (so it's no longer truly destructive), then wipes.
+  const resetDay = () => {
+    archiveSession("reset");
+    wipeDayData();
+    setResetConfirmOpen(false);
+    notify("Data reset — today's session was archived first, then cleared. Roster untouched.", "success");
+  };
+  // "Archive Now" — same archive-then-wipe action, available anytime from the Bills footer.
+  const archiveNow = () => {
+    const entry = archiveSession("manual");
+    setArchiveNowConfirmOpen(false);
+    if (!entry) { notify("Nothing to archive — no player has a nonzero bill yet.", "warn"); return; }
+    wipeDayData();
+    notify(`Session archived as "${entry.label}" and cleared for a new one.`, "success");
+  };
+  // Undo: only ever offered for the single most-recently-archived session, and only restores
+  // the raw per-player stats (matches/shuttle games/misc/paid) — not history, queue, or courts,
+  // which aren't recoverable. This is a safety net for an accidental archive, not a full undo.
+  const undoLastArchive = (archiveId) => {
+    const entry = archivedSessions[0];
+    if (!entry || entry.id !== archiveId) return; // only the newest one is ever undoable
+    setPlayers((prev) => prev.map((p) => {
+      const row = entry.rows.find((r) => r.id === p.id);
+      if (!row) return p;
+      return { ...p, matchesToday: (p.matchesToday || 0) + row.rawMatchesToday, shuttleGamesToday: (p.shuttleGamesToday || 0) + row.rawShuttleGamesToday, miscAdjustment: row.rawMiscAdjustment, paidToday: row.paid };
+    }));
+    setArchivedSessions((prev) => prev.filter((a) => a.id !== archiveId));
+    notify("Last archived session restored to live Bills.", "success");
+  };
+  // Toggles Paid on a row WITHIN an archived session (frozen snapshot), independent of live players.
+  const toggleArchivedPaid = (archiveId, rowId) => {
+    setArchivedSessions((prev) => prev.map((a) => (a.id !== archiveId ? a : {
+      ...a, rows: a.rows.map((r) => (r.id === rowId ? { ...r, paid: !r.paid } : r)),
+    })));
+  };
+
   // "Clear Roster" — the roster's own reset: removes every player. Doesn't touch history or Settings.
   const clearRoster = () => {
     setPlayers([]);
@@ -561,7 +733,7 @@ function App() {
   /* ---------- player management ---------- */
   const addPlayer = (name, level, gender) => {
     if (!name.trim()) return;
-    setPlayers((prev) => [...prev, { id: uid("pl"), name: name.trim(), level, gender, matchesToday: 0, sitOutStreak: 0, shuttleGamesToday: 0, miscAdjustment: "" }]);
+    setPlayers((prev) => [...prev, { id: uid("pl"), name: name.trim(), level, gender, matchesToday: 0, sitOutStreak: 0, shuttleGamesToday: 0, miscAdjustment: "", paidToday: false }]);
     notify(`${name.trim()} added to roster.`, "success");
   };
   const editPlayer = (id, fields) => setPlayers((prev) => prev.map((p) => (p.id === id ? { ...p, ...fields } : p)));
@@ -601,31 +773,79 @@ function App() {
   const removeCourt = (id) => setCourts((prev) => { const c = prev.find((x) => x.id === id); return c?.match ? prev : prev.filter((x) => x.id !== id); });
   const toggleShuttleRequest = (courtId) => setCourts((prev) => prev.map((c) => (c.id === courtId ? { ...c, needsShuttle: !c.needsShuttle } : c)));
 
+  // The actual "apply a completed match" effect — takes an explicit court snapshot rather than
+  // re-reading from state, so it still works correctly even if state was just wiped by an
+  // archive that happened moments earlier (see completeMatch below).
+  const performCompleteMatch = (courtId, court) => {
+    if (!court?.match) return;
+    const ids = [...court.match.teamA, ...court.match.teamB];
+    const shuttleUsed = !!court.needsShuttle;
+    setPlayers((pl) => pl.map((p) => (ids.includes(p.id)
+      ? { ...p, matchesToday: p.matchesToday + 1, shuttleGamesToday: (p.shuttleGamesToday || 0) + (shuttleUsed ? 1 : 0) }
+      : p)));
+    setPlayedGroups((g) => [...g, groupKey(ids)].slice(-400));
+    setHistory((h) => [{
+      id: uid("hist"), time: Date.now(), court: court.label, category: court.match.category, shuttleUsed,
+      teamAIds: court.match.teamA, teamBIds: court.match.teamB,
+      teamA: court.match.teamA.map((id) => playersById[id]?.name || "?"),
+      teamB: court.match.teamB.map((id) => playersById[id]?.name || "?"),
+      scoreA: "", scoreB: "",
+    }, ...h].slice(0, 500));
+    setQueue((q) => [...q, ...ids]);
+    setCourts((prev) => prev.map((c) => (c.id === courtId ? { ...c, match: null, needsShuttle: false } : c)));
+  };
+  // Auto-trigger check: only relevant if there IS a previous match, it happened on a different
+  // calendar day, AND at least 3 hours have passed — covers playing past midnight without
+  // false-triggering on a same-day gap between morning/evening sessions.
+  const shouldPromptNewDayArchive = () => {
+    if (history.length === 0) return false;
+    const last = history[0]; // history is newest-first
+    const differentDay = new Date(last.time).toDateString() !== new Date().toDateString();
+    const hoursSince = (Date.now() - last.time) / (1000 * 60 * 60);
+    return differentDay && hoursSince >= 3;
+  };
   const completeMatch = (courtId) => {
-    setCourts((prev) => {
-      const court = prev.find((c) => c.id === courtId);
-      if (!court?.match) return prev;
-      const ids = [...court.match.teamA, ...court.match.teamB];
-      const shuttleUsed = !!court.needsShuttle;
-      setPlayers((pl) => pl.map((p) => (ids.includes(p.id)
-        ? { ...p, matchesToday: p.matchesToday + 1, shuttleGamesToday: (p.shuttleGamesToday || 0) + (shuttleUsed ? 1 : 0) }
-        : p)));
-      setPlayedGroups((g) => [...g, groupKey(ids)].slice(-400));
-      setHistory((h) => [{
-        id: uid("hist"), time: Date.now(), court: court.label, category: court.match.category, shuttleUsed,
-        teamAIds: court.match.teamA, teamBIds: court.match.teamB,
-        teamA: court.match.teamA.map((id) => playersById[id]?.name || "?"),
-        teamB: court.match.teamB.map((id) => playersById[id]?.name || "?"),
-        scoreA: "", scoreB: "",
-      }, ...h].slice(0, 500));
-      setQueue((q) => [...q, ...ids]);
-      return prev.map((c) => (c.id === courtId ? { ...c, match: null, needsShuttle: false } : c));
-    });
+    const court = courts.find((c) => c.id === courtId);
+    if (!court?.match) return;
+    if (shouldPromptNewDayArchive()) {
+      setPendingNewDayMatch({ courtId, court }); // snapshot taken now, before any archive/wipe
+      return;
+    }
+    performCompleteMatch(courtId, court);
+  };
+  // Called from the confirm modal — Option A safety net for the auto-trigger.
+  const confirmNewDayArchive = () => {
+    const pending = pendingNewDayMatch;
+    archiveSession("auto");
+    wipeDayData();
+    setPendingNewDayMatch(null);
+    if (pending) performCompleteMatch(pending.courtId, pending.court);
+    notify("Previous session archived — starting fresh for the new match.", "success");
+  };
+  const cancelNewDayArchive = () => {
+    const pending = pendingNewDayMatch;
+    setPendingNewDayMatch(null);
+    if (pending) performCompleteMatch(pending.courtId, pending.court);
   };
   // Scores are digits-only, blank by default (no forced "0" to delete before typing).
   const setHistoryScore = (id, field, value) => {
     const clean = value.replace(/[^0-9]/g, "").slice(0, 3);
     setHistory((prev) => prev.map((h) => (h.id === id ? { ...h, [field]: clean } : h)));
+  };
+  // Toggles whether a PAST match used a new shuttlecock, correcting the actual shuttle-game
+  // count on the 4 players involved (not just relabeling it) — so Payment/Bills stays accurate.
+  // Players since deleted from the roster are automatically skipped: .map only touches players
+  // that still exist, so there's nothing extra to check for.
+  const toggleShuttleUsed = (historyId) => {
+    const entry = history.find((h) => h.id === historyId);
+    if (!entry) return;
+    const willBeUsed = !entry.shuttleUsed;
+    const delta = willBeUsed ? 1 : -1;
+    const ids = [...(entry.teamAIds || []), ...(entry.teamBIds || [])];
+    setPlayers((prev) => prev.map((p) => (ids.includes(p.id)
+      ? { ...p, shuttleGamesToday: Math.max(0, (p.shuttleGamesToday || 0) + delta) }
+      : p)));
+    setHistory((prev) => prev.map((h) => (h.id === historyId ? { ...h, shuttleUsed: willBeUsed } : h)));
   };
   const cancelMatch = (courtId) => {
     setCourts((prev) => {
@@ -846,6 +1066,7 @@ Respond with ONLY raw JSON, no markdown fences, no commentary, in exactly this s
 
   const fontFamily = (FONT_OPTIONS[fontChoice] || FONT_OPTIONS.manrope).stack;
   const fontScale = FONT_SIZES[fontSizeChoice] ?? 1;
+  const exportColors = { ...(THEMES[theme] || THEMES.green), ...SEMANTIC_COLORS };
   const rootStyle = { zoom: fontScale };
 
   if (!loaded) {
@@ -868,7 +1089,7 @@ Respond with ONLY raw JSON, no markdown fences, no commentary, in exactly this s
           <CourtsTab
             courts={courts} playersById={playersById} queue={queue} players={players}
             pendingMatches={pendingMatches} aiLoading={aiLoading}
-            geminiKeyIndex={geminiKeyIndex} setGeminiKeyIndex={setGeminiKeyIndex} geminiKeys={geminiKeys}
+            geminiKeyIndex={geminiKeyIndex} geminiKeys={geminiKeys}
             addCourt={addCourt} removeCourt={removeCourt} toggleShuttleRequest={toggleShuttleRequest}
             runGenerate={runGenerate} askAiSeries={askAiSeries}
             openManual={() => setManualOpen(true)}
@@ -882,14 +1103,19 @@ Respond with ONLY raw JSON, no markdown fences, no commentary, in exactly this s
         {tab === "players" && (
           <PlayersTab players={players} addPlayer={addPlayer} editPlayer={editPlayer} deletePlayer={deletePlayer} addToQueue={addToQueue} queue={queue} reservedIds={reservedIds} clearRoster={clearRoster} />
         )}
-        {tab === "history" && <HistoryTab history={history} deleteHistoryEntry={deleteHistoryEntry} clearHistory={clearHistory} setHistoryScore={setHistoryScore} />}
+        {tab === "history" && <HistoryTab history={history} deleteHistoryEntry={deleteHistoryEntry} clearHistory={clearHistory} setHistoryScore={setHistoryScore} toggleShuttleUsed={toggleShuttleUsed} />}
         {tab === "ranking" && <RankingTab players={players} history={history} />}
         {tab === "payment" && (
-          <PaymentTab players={players} shuttlePrice={shuttlePrice} setShuttlePrice={setShuttlePrice} courtFeePerHour={courtFeePerHour} setCourtFeePerHour={setCourtFeePerHour} setPlayerMisc={setPlayerMisc} />
+          <PaymentTab
+            players={players} shuttlePrice={shuttlePrice} setShuttlePrice={setShuttlePrice} courtFeePerHour={courtFeePerHour} setCourtFeePerHour={setCourtFeePerHour}
+            setPlayerMisc={setPlayerMisc} togglePaid={togglePaid} colors={exportColors}
+            onOpenPreviousBills={() => setPreviousBillsOpen(true)} onArchiveNow={() => setArchiveNowConfirmOpen(true)}
+          />
         )}
         {tab === "settings" && (
           <SettingsTab
             geminiKeys={geminiKeys} setGeminiKeys={setGeminiKeys}
+            geminiKeyIndex={geminiKeyIndex} setGeminiKeyIndex={setGeminiKeyIndex}
             theme={theme} setTheme={setTheme}
             fontChoice={fontChoice} setFontChoice={setFontChoice}
             fontSizeChoice={fontSizeChoice} setFontSizeChoice={setFontSizeChoice}
@@ -918,6 +1144,24 @@ Respond with ONLY raw JSON, no markdown fences, no commentary, in exactly this s
 
       {resetConfirmOpen && (
         <ResetDayModal playerCount={players.length} onClose={() => setResetConfirmOpen(false)} onConfirm={resetDay} />
+      )}
+
+      {pendingNewDayMatch && (
+        <NewDayArchiveModal onConfirm={confirmNewDayArchive} onCancel={cancelNewDayArchive} />
+      )}
+
+      {archiveNowConfirmOpen && (
+        <ArchiveNowModal onClose={() => setArchiveNowConfirmOpen(false)} onConfirm={archiveNow} />
+      )}
+
+      {previousBillsOpen && (
+        <PreviousBillsModal
+          archivedSessions={archivedSessions} colors={exportColors}
+          onClose={() => setPreviousBillsOpen(false)}
+          onTogglePaid={toggleArchivedPaid}
+          onUndo={(id) => { undoLastArchive(id); setPreviousBillsOpen(false); }}
+          onExport={(rows, label) => shareImage(label, BILLS_COLUMNS, rows, exportColors)}
+        />
       )}
 
       {toast && <div className={`bq-toast bq-toast-${toast.kind}`}>{toast.msg}</div>}
@@ -974,7 +1218,7 @@ function TabBar({ tab, setTab, counts }) {
 /* ---------------------------------------------------------------------- */
 function CourtsTab({
   courts, playersById, queue, players, pendingMatches, aiLoading,
-  geminiKeyIndex, setGeminiKeyIndex, geminiKeys,
+  geminiKeyIndex, geminiKeys,
   addCourt, removeCourt, toggleShuttleRequest, runGenerate, askAiSeries, openManual,
   completeMatch, cancelMatch, sendPendingToCourt, sendToFirstOpenCourt, cancelPendingMatch,
   swapWithPool, swapWithSlot,
@@ -1007,14 +1251,8 @@ function CourtsTab({
                 {aiLoading ? <Loader2 size={15} className="bq-spin" /> : <Sparkles size={15} />} Ask Gemini
               </button>
             </Tooltip>
-            <select className="bq-select" value={geminiKeyIndex} onChange={(e) => setGeminiKeyIndex(Number(e.target.value))} title="Switch key if one hits its rate limit">
-              {[0, 1, 2].map((i) => (
-                <option key={i} value={i}>Gemini AI {i + 1}{(geminiKeys[i] || "").trim() ? "" : " (not set)"}</option>
-              ))}
-            </select>
             <button className="bq-btn bq-btn-ghost" onClick={openManual}><Wand2 size={15} /> Build manually</button>
           </div>
-          {!geminiReady && <p className="bq-muted-sm">Gemini AI {geminiKeyIndex + 1} has no key yet — add one in the Settings tab.</p>}
         </div>
 
         {pendingMatches.length > 0 && (
@@ -1066,7 +1304,7 @@ function CourtsTab({
             {availableToAdd.length === 0 && <p className="bq-muted-sm">Everyone is already queued or playing.</p>}
             {availableToAdd.map((p) => (
               <button key={p.id} className="bq-add-row" onClick={() => addToQueue(p.id)}>
-                <Avatar name={p.name} size={26} /><span className="bq-add-name">{p.name}</span><LevelBadge level={p.level} /><Plus size={14} />
+                <Avatar name={p.name} size={26} /><span className="bq-add-name">{p.name}</span><LevelBadge level={p.level} abbreviate /><Plus size={14} />
               </button>
             ))}
           </div>
@@ -1084,7 +1322,7 @@ function CourtsTab({
                 <div className="bq-queue-info">
                   <div className="bq-queue-name">{p.name} <GenderDot gender={p.gender} /></div>
                   <div className="bq-queue-meta">
-                    <LevelBadge level={p.level} />
+                    <LevelBadge level={p.level} abbreviate />
                     <span className="bq-mono">{p.matchesToday} played</span>
                     {p.sitOutStreak > 0 && <span className="bq-streak-badge" title="Rounds sat out in a row">⏳ {p.sitOutStreak}</span>}
                   </div>
@@ -1133,9 +1371,9 @@ function PendingMatchCard({
           </>
         ) : (
           <>
-            <TeamBlock ids={match.teamA} playersById={playersById} />
+            <TeamBlock ids={match.teamA} playersById={playersById} abbreviate />
             <div className="bq-vs">VS</div>
-            <TeamBlock ids={match.teamB} playersById={playersById} />
+            <TeamBlock ids={match.teamB} playersById={playersById} abbreviate />
           </>
         )}
       </div>
@@ -1167,7 +1405,7 @@ function EditableTeam({ team, ids, playersById, matchId, swapPickerFor, setSwapP
           <div key={id} className="bq-team-player-edit-wrap">
             <button className="bq-team-player bq-team-player-edit" onClick={() => setSwapPickerFor(isOpen ? null : { matchId, team, idx })}>
               <Avatar name={p.name} size={30} />
-              <div><div className="bq-team-name">{p.name}</div><LevelBadge level={p.level} /></div>
+              <div><div className="bq-team-name">{p.name}</div><LevelBadge level={p.level} abbreviate /></div>
               <Pencil size={11} className="bq-team-edit-icon" />
             </button>
             {isOpen && (
@@ -1220,7 +1458,7 @@ function SwapPicker({ originId, originMatchId, originTeam, originIdx, pendingMat
       <button key={`${item.matchId || "pool"}-${item.id}`} className="bq-swap-candidate" onClick={() => onPick(item)}>
         <Avatar name={p.name} size={22} />
         <span className="bq-swap-candidate-name">{p.name}</span>
-        <LevelBadge level={p.level} />
+        <LevelBadge level={p.level} abbreviate />
       </button>
     );
   };
@@ -1284,9 +1522,9 @@ function CourtCard({ court, playersById, pendingCount, onStartNext, onComplete, 
         <div className="bq-match">
           <CategoryChip category={m.category} />
           <div className="bq-teams">
-            <TeamBlock ids={m.teamA} playersById={playersById} />
+            <TeamBlock ids={m.teamA} playersById={playersById} abbreviate />
             <div className="bq-vs">VS</div>
-            <TeamBlock ids={m.teamB} playersById={playersById} />
+            <TeamBlock ids={m.teamB} playersById={playersById} abbreviate />
           </div>
           <div className="bq-match-actions">
             <button className="bq-btn bq-btn-ghost" onClick={onCancel}><LogOut size={14} /> Cancel</button>
@@ -1363,17 +1601,109 @@ function ResetDayModal({ playerCount, onClose, onConfirm }) {
         <div className="bq-modal-body">
           <p className="bq-muted-sm">This clears everything except the roster ({playerCount} player{playerCount !== 1 ? "s" : ""} stay):</p>
           <ul className="bq-reset-list">
+            <li>Today's Bill is archived to "Previous bills" first, so it's not lost</li>
             <li>Match history &amp; recorded scores (also clears the Ranking tab)</li>
             <li>Matches played, sit-out streak, shuttlecock count, misc adjustments — back to 0/blank for every player</li>
             <li>The waiting pool and any pending matches</li>
             <li>Any matches currently in progress on a court — ended, not logged</li>
             <li>"Already played together" grouping history</li>
           </ul>
-          <p className="bq-muted-sm">The roster itself and all Settings (theme, font, Gemini keys) are <b>not</b> touched. This can't be undone.</p>
+          <p className="bq-muted-sm">The roster itself and all Settings (theme, font, Gemini keys) are <b>not</b> touched. The archived bill can be restored from Previous Bills if this was a mistake, but the match log and queue state are not recoverable.</p>
           <div className="bq-modal-actions">
             <button className="bq-btn bq-btn-ghost" onClick={onClose}>Cancel</button>
             <button className="bq-btn bq-btn-danger" onClick={onConfirm}><Check size={14} /> Yes, reset data</button>
           </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Archive-related modals                                                 */
+/* ---------------------------------------------------------------------- */
+function NewDayArchiveModal({ onConfirm, onCancel }) {
+  return (
+    <div className="bq-modal-overlay" onClick={onCancel}>
+      <div className="bq-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 400 }}>
+        <div className="bq-modal-head"><h3><AlertTriangle size={17} /> Start a new session?</h3><button className="bq-icon-btn" onClick={onCancel}><X size={18} /></button></div>
+        <div className="bq-modal-body">
+          <p className="bq-muted-sm">It's been a while since the last match, and it looks like it was on a different day. Archive today's — well, that session's — Bill and start fresh before recording this match?</p>
+          <div className="bq-modal-actions">
+            <button className="bq-btn bq-btn-ghost" onClick={onCancel}>No, keep going</button>
+            <button className="bq-btn bq-btn-primary" onClick={onConfirm}><Check size={14} /> Yes, archive &amp; start fresh</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+function ArchiveNowModal({ onClose, onConfirm }) {
+  return (
+    <div className="bq-modal-overlay" onClick={onClose}>
+      <div className="bq-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 400 }}>
+        <div className="bq-modal-head"><h3><AlertTriangle size={17} /> Archive now?</h3><button className="bq-icon-btn" onClick={onClose}><X size={18} /></button></div>
+        <div className="bq-modal-body">
+          <p className="bq-muted-sm">This saves today's Bill into Previous Bills, then clears the live session — same as Reset Data, just triggered manually. The roster and Settings aren't touched.</p>
+          <div className="bq-modal-actions">
+            <button className="bq-btn bq-btn-ghost" onClick={onClose}>Cancel</button>
+            <button className="bq-btn bq-btn-primary" onClick={onConfirm}><Check size={14} /> Archive now</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+function PreviousBillsModal({ archivedSessions, colors, onClose, onTogglePaid, onUndo, onExport }) {
+  const [activeIdx, setActiveIdx] = useState(0);
+  const active = archivedSessions[activeIdx];
+  const isNewest = activeIdx === 0;
+  return (
+    <div className="bq-modal-overlay" onClick={onClose}>
+      <div className="bq-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 560 }}>
+        <div className="bq-modal-head"><h3><Clock size={17} /> Previous bills</h3><button className="bq-icon-btn" onClick={onClose}><X size={18} /></button></div>
+        <div className="bq-modal-body">
+          {archivedSessions.length === 0 ? (
+            <p className="bq-empty">No archived sessions yet — Reset Data or Archive Now will save one here.</p>
+          ) : (
+            <>
+              <div className="bq-chip-row" style={{ marginBottom: 12 }}>
+                {archivedSessions.map((a, i) => (
+                  <button key={a.id} className={`bq-chip ${i === activeIdx ? "bq-chip-active" : ""}`} onClick={() => setActiveIdx(i)}>{a.label}</button>
+                ))}
+              </div>
+              {active && (
+                <>
+                  <div className="bq-pay-table-scroll">
+                    <table className="bq-pay-table">
+                      <thead><tr><th>Player</th><th>Games</th><th>Misc</th><th>Total</th><th>Paid</th></tr></thead>
+                      <tbody>
+                        {active.rows.map((r) => (
+                          <tr key={r.id}>
+                            <td>{r.name}</td>
+                            <td className="bq-mono">{r.games}</td>
+                            <td className="bq-mono">{fmt(r.misc)}</td>
+                            <td className="bq-mono bq-pay-total-cell">{fmt(r.total)}</td>
+                            <td>
+                              <label className="bq-paid-check">
+                                <input type="checkbox" checked={r.paid} onChange={() => onTogglePaid(active.id, r.id)} />
+                              </label>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="bq-modal-actions" style={{ justifyContent: "space-between" }}>
+                    {isNewest ? (
+                      <button className="bq-btn bq-btn-ghost" onClick={() => onUndo(active.id)}>Undo — restore to live Bills</button>
+                    ) : <span />}
+                    <button className="bq-btn bq-btn-primary" onClick={() => onExport(active.rows, active.label)}>Share</button>
+                  </div>
+                </>
+              )}
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -1469,7 +1799,7 @@ function PlayersTab({ players, addPlayer, editPlayer, deletePlayer, addToQueue, 
 /* ---------------------------------------------------------------------- */
 /*  History tab                                                            */
 /* ---------------------------------------------------------------------- */
-function HistoryTab({ history, deleteHistoryEntry, clearHistory, setHistoryScore }) {
+function HistoryTab({ history, deleteHistoryEntry, clearHistory, setHistoryScore, toggleShuttleUsed }) {
   const [confirmClear, setConfirmClear] = useState(false);
 
   useEffect(() => {
@@ -1487,30 +1817,39 @@ function HistoryTab({ history, deleteHistoryEntry, clearHistory, setHistoryScore
   return (
     <div className="bq-history">
       <div className="bq-section-head">
-        <h2>Match history <span className="bq-muted-sm">(today's session)</span></h2>
-        {history.length > 0 && (
-          <button className={`bq-btn ${confirmClear ? "bq-btn-danger" : "bq-btn-ghost"}`} onClick={handleClearClick}>
-            <Trash2 size={14} /> {confirmClear ? "Click again to confirm" : "Clear History"}
-          </button>
-        )}
+        <h2>Match history</h2>
+        <div className="bq-row-gap" style={{ alignItems: "center" }}>
+          {history.length > 0 && <InfoTip text="Deleting a single match also undoes its game & shuttle count. Enter final scores here to populate the Ranking tab." />}
+          {history.length > 0 && (
+            <button className={`bq-btn ${confirmClear ? "bq-btn-danger" : "bq-btn-ghost"}`} onClick={handleClearClick}>
+              <Trash2 size={14} /> {confirmClear ? "Click again to confirm" : "Clear History"}
+            </button>
+          )}
+        </div>
       </div>
-      {history.length > 0 && <p className="bq-muted-sm" style={{ marginTop: -6, marginBottom: 10 }}>Deleting a single match also undoes its game &amp; shuttle count. Enter final scores here to populate the Ranking tab.</p>}
       {history.length === 0 && <p className="bq-empty">No completed matches yet.</p>}
       <div className="bq-history-list">
         {history.map((h) => (
-          <div key={h.id} className="bq-history-row">
-            <div className="bq-history-time">{new Date(h.time).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}</div>
-            <div className="bq-history-court">{h.court}</div>
-            <CategoryChip category={h.category} />
-            {h.shuttleUsed && <span title="Shuttlecock used this game">🏸</span>}
-            <div className="bq-history-teams">
-              <span>{h.teamA.join(" & ")}</span>
-              <input type="text" inputMode="numeric" placeholder="0" className="bq-score-input" value={h.scoreA || ""} onChange={(e) => setHistoryScore(h.id, "scoreA", e.target.value)} title="Team A final score" />
-              <span className="bq-vs-sm">vs</span>
-              <input type="text" inputMode="numeric" placeholder="0" className="bq-score-input" value={h.scoreB || ""} onChange={(e) => setHistoryScore(h.id, "scoreB", e.target.value)} title="Team B final score" />
-              <span>{h.teamB.join(" & ")}</span>
+          <div key={h.id} className="bq-history-card">
+            <div className="bq-history-row1">
+              <span className="bq-history-time">{new Date(h.time).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}</span>
+              <span className="bq-history-court">{h.court}</span>
+              <CategoryChip category={h.category} />
+              <Tooltip text={h.shuttleUsed ? "New shuttlecock" : "Old shuttlecock"}>
+                <button type="button" className="bq-shuttle-toggle" onClick={() => toggleShuttleUsed(h.id)} aria-label="Toggle whether a new shuttlecock was used for this match">
+                  {h.shuttleUsed ? "👶🏻" : "👴🏻"}
+                </button>
+              </Tooltip>
+              <button className="bq-icon-btn bq-icon-danger bq-history-delete" title="Delete this match" onClick={() => deleteHistoryEntry(h.id)}><X size={14} /></button>
             </div>
-            <button className="bq-icon-btn bq-icon-danger" title="Delete this match" onClick={() => deleteHistoryEntry(h.id)}><X size={14} /></button>
+            <div className="bq-history-row2">
+              <span className="bq-history-team-name">{h.teamA.join(" & ")}</span>
+              <input type="text" inputMode="numeric" placeholder="0" className="bq-score-input" value={h.scoreA || ""} onChange={(e) => setHistoryScore(h.id, "scoreA", e.target.value)} title="Team A final score" />
+            </div>
+            <div className="bq-history-row3">
+              <span className="bq-history-team-name">{h.teamB.join(" & ")}</span>
+              <input type="text" inputMode="numeric" placeholder="0" className="bq-score-input" value={h.scoreB || ""} onChange={(e) => setHistoryScore(h.id, "scoreB", e.target.value)} title="Team B final score" />
+            </div>
           </div>
         ))}
       </div>
@@ -1522,6 +1861,7 @@ function HistoryTab({ history, deleteHistoryEntry, clearHistory, setHistoryScore
 /*  Ranking tab                                                            */
 /* ---------------------------------------------------------------------- */
 function RankingTab({ players, history }) {
+  const colors = useThemeColors();
   const [subTab, setSubTab] = useState("wins");
   const ranked = computeRankings(history, players);
 
@@ -1539,6 +1879,7 @@ function RankingTab({ players, history }) {
     { key: "points", label: "By Points" },
     { key: "winPercent", label: "By Win%" },
   ];
+  const activeLabel = subTabs.find((t) => t.key === subTab).label;
 
   return (
     <div className="bq-ranking">
@@ -1549,25 +1890,28 @@ function RankingTab({ players, history }) {
       </div>
 
       <div className="bq-pay-table-wrap">
-        <h2>{subTabs.find((t) => t.key === subTab).label} <span className="bq-muted-sm">({sorted.length} ranked)</span></h2>
+        <div className="bq-pay-heading-row">
+          <h2>{activeLabel} <span className="bq-muted-sm">({sorted.length} ranked)</span></h2>
+          <button className="bq-btn bq-btn-ghost" onClick={() => shareImage(activeLabel, rankingColumns(subTab), sorted, colors)} disabled={sorted.length === 0}>Share</button>
+        </div>
         {sorted.length === 0 ? (
           <p className="bq-empty">No scored matches yet. Enter final scores in the History tab to populate rankings — players only appear here once they have at least one scored match.</p>
         ) : (
           <div className="bq-pay-table-scroll">
             <table className="bq-pay-table">
               <thead>
-                <tr><th>#</th><th>Player</th><th>Wins</th><th>Matches</th><th>Win%</th><th>Points</th><th>Score diff</th></tr>
+                {subTab === "wins" && <tr><th>#</th><th>Player</th><th>Wins</th><th>Score diff</th></tr>}
+                {subTab === "points" && <tr><th>#</th><th>Player</th><th>Points</th><th>Matches</th></tr>}
+                {subTab === "winPercent" && <tr><th>#</th><th>Player</th><th>Win%</th><th>Score diff</th></tr>}
               </thead>
               <tbody>
                 {sorted.map((p, i) => (
                   <tr key={p.id}>
                     <td className="bq-mono">{i + 1}</td>
                     <td>{p.name}</td>
-                    <td className="bq-mono">{p.wins}</td>
-                    <td className="bq-mono">{p.matches}</td>
-                    <td className="bq-mono">{Math.round((p.wins / p.matches) * 100)}%</td>
-                    <td className="bq-mono">{p.points}</td>
-                    <td className="bq-mono">{p.scoreDiff >= 0 ? "+" : ""}{p.scoreDiff}</td>
+                    {subTab === "wins" && <><td className="bq-mono">{p.wins}</td><td className="bq-mono">{p.scoreDiff >= 0 ? "+" : ""}{p.scoreDiff}</td></>}
+                    {subTab === "points" && <><td className="bq-mono">{p.points}</td><td className="bq-mono">{p.matches}</td></>}
+                    {subTab === "winPercent" && <><td className="bq-mono">{Math.round((p.wins / p.matches) * 100)}%</td><td className="bq-mono">{p.scoreDiff >= 0 ? "+" : ""}{p.scoreDiff}</td></>}
                   </tr>
                 ))}
               </tbody>
@@ -1582,27 +1926,11 @@ function RankingTab({ players, history }) {
 /* ---------------------------------------------------------------------- */
 /*  Payment tab                                                            */
 /* ---------------------------------------------------------------------- */
-const fmt = (n) => `₱${(n || 0).toFixed(2)}`;
 
-function PaymentTab({ players, shuttlePrice, setShuttlePrice, courtFeePerHour, setCourtFeePerHour, setPlayerMisc }) {
-  const shuttlePriceNum = parseFloat(shuttlePrice) || 0;
-  const courtFeePerHourNum = parseFloat(courtFeePerHour) || 0;
-  const perGameCourtFee = courtFeePerHourNum / 3 / 4;
-  const perGameShuttleFee = shuttlePriceNum / 4;
-
-  const rows = players
-    .map((p) => {
-      // Court fee is rounded UP to the nearest whole peso per player, per the house rule.
-      const courtCost = Math.ceil(perGameCourtFee * p.matchesToday);
-      const shuttleCost = perGameShuttleFee * (p.shuttleGamesToday || 0);
-      const misc = parseFloat(p.miscAdjustment) || 0;
-      return { ...p, courtCost, shuttleCost, misc, total: courtCost + shuttleCost + misc };
-    })
-    .sort((a, b) => a.name.localeCompare(b.name));
-
-  const grand = rows.reduce((acc, r) => ({
-    court: acc.court + r.courtCost, shuttle: acc.shuttle + r.shuttleCost, misc: acc.misc + r.misc, total: acc.total + r.total,
-  }), { court: 0, shuttle: 0, misc: 0, total: 0 });
+function PaymentTab({ players, shuttlePrice, setShuttlePrice, courtFeePerHour, setCourtFeePerHour, setPlayerMisc, togglePaid, colors, onOpenPreviousBills, onArchiveNow }) {
+  const perGameCourtFee = (parseFloat(courtFeePerHour) || 0) / 3 / 4;
+  const rows = computeBillRows(players, shuttlePrice, courtFeePerHour);
+  const grand = rows.reduce((acc, r) => ({ misc: acc.misc + r.misc, total: acc.total + r.total }), { misc: 0, total: 0 });
 
   return (
     <div className="bq-payment">
@@ -1610,67 +1938,72 @@ function PaymentTab({ players, shuttlePrice, setShuttlePrice, courtFeePerHour, s
         <h2>Rates</h2>
         <div className="bq-pay-settings-grid">
           <label className="bq-pay-field">
-            <span>Shuttlecock price</span>
+            <span>Shuttlecock price <InfoTip text="Split 4 ways, charged to a player only for games where the court's &quot;New shuttlecock&quot; box was ticked." /></span>
             <div className="bq-pay-input-wrap">
               <span>₱</span>
               <input type="text" inputMode="decimal" placeholder="0.00" className="bq-input" value={shuttlePrice} onChange={(e) => setShuttlePrice(e.target.value)} />
             </div>
-            <small className="bq-muted-sm">Split 4 ways, charged to a player only for games where the court's "New shuttlecock" box was ticked.</small>
           </label>
           <label className="bq-pay-field">
-            <span>Court fee per hour</span>
+            <span>Court fee per hour <InfoTip text={`÷ 3 games/hour ÷ 4 players = ${fmt(perGameCourtFee)} per player per game, rounded up to the next peso in the table.`} /></span>
             <div className="bq-pay-input-wrap">
               <span>₱</span>
               <input type="text" inputMode="decimal" placeholder="0.00" className="bq-input" value={courtFeePerHour} onChange={(e) => setCourtFeePerHour(e.target.value)} />
             </div>
-            <small className="bq-muted-sm">÷ 3 games/hour ÷ 4 players = {fmt(perGameCourtFee)} per player per game, rounded up to the next peso in the table.</small>
           </label>
         </div>
-        <p className="bq-muted-sm"><Info size={12} style={{ verticalAlign: "-2px" }} /> Use the Misc column in the table to add a one-off charge (+) or credit (−) for any individual player.</p>
       </div>
 
       <div className="bq-pay-table-wrap">
-        <h2>Today's bill <span className="bq-muted-sm">({rows.length} players)</span></h2>
+        <div className="bq-pay-heading-row">
+          <h2>Bills <span className="bq-muted-sm">({rows.length} players)</span> <InfoTip text="Use the Misc column to add a one-off charge (+) or credit (−) for any individual player. Only players with a nonzero total are shown." /></h2>
+          <button className="bq-btn bq-btn-ghost" onClick={() => shareImage("Bills", BILLS_COLUMNS, rows, colors)} disabled={rows.length === 0}>Share</button>
+        </div>
         {rows.length === 0 ? (
-          <p className="bq-empty">No players yet.</p>
+          <p className="bq-empty">No players with a bill yet.</p>
         ) : (
           <div className="bq-pay-table-scroll">
           <table className="bq-pay-table">
             <thead>
-              <tr><th>#</th><th>Player</th><th>Games</th><th>Court fee</th><th>Shuttle fee</th><th>Misc (+/−)</th><th>Total</th></tr>
+              <tr><th>Player</th><th>Games</th><th>Misc (+/−)</th><th>Total</th><th>Paid</th></tr>
             </thead>
             <tbody>
-              {rows.map((r, i) => (
-                <tr key={r.id} className={r.matchesToday === 0 && r.misc === 0 ? "bq-pay-row-idle" : ""}>
-                  <td className="bq-mono">{i + 1}</td>
+              {rows.map((r) => (
+                <tr key={r.id}>
                   <td>{r.name}</td>
-                  <td className="bq-mono">{r.matchesToday}</td>
-                  <td className="bq-mono">{fmt(r.courtCost)}</td>
-                  <td className="bq-mono">{fmt(r.shuttleCost)}</td>
+                  <td className="bq-mono">{r.games}</td>
                   <td>
                     <input
                       type="text" inputMode="text" placeholder="0" className="bq-pay-misc-input"
-                      value={r.miscAdjustment || ""}
+                      value={r.rawMiscAdjustment || ""}
                       onChange={(e) => setPlayerMisc(r.id, e.target.value)}
                       title="Add a charge (positive) or credit (negative) for this player"
                     />
                   </td>
                   <td className="bq-mono bq-pay-total-cell">{fmt(r.total)}</td>
+                  <td>
+                    <label className="bq-paid-check">
+                      <input type="checkbox" checked={r.paid} onChange={() => togglePaid(r.id)} />
+                    </label>
+                  </td>
                 </tr>
               ))}
             </tbody>
             <tfoot>
               <tr>
-                <td colSpan={3}>Grand total</td>
-                <td className="bq-mono">{fmt(grand.court)}</td>
-                <td className="bq-mono">{fmt(grand.shuttle)}</td>
+                <td colSpan={2}>Grand total</td>
                 <td className="bq-mono">{fmt(grand.misc)}</td>
                 <td className="bq-mono bq-pay-total-cell">{fmt(grand.total)}</td>
+                <td></td>
               </tr>
             </tfoot>
           </table>
           </div>
         )}
+        <div className="bq-pay-footer">
+          <button className="bq-link-btn" onClick={onOpenPreviousBills}>Previous bills</button>
+          <button className="bq-btn bq-btn-primary" onClick={onArchiveNow}>Archive now</button>
+        </div>
       </div>
     </div>
   );
@@ -1679,14 +2012,21 @@ function PaymentTab({ players, shuttlePrice, setShuttlePrice, courtFeePerHour, s
 /* ---------------------------------------------------------------------- */
 /*  Settings tab                                                           */
 /* ---------------------------------------------------------------------- */
-function SettingsTab({ geminiKeys, setGeminiKeys, theme, setTheme, fontChoice, setFontChoice, fontSizeChoice, setFontSizeChoice }) {
+function SettingsTab({ geminiKeys, setGeminiKeys, geminiKeyIndex, setGeminiKeyIndex, theme, setTheme, fontChoice, setFontChoice, fontSizeChoice, setFontSizeChoice }) {
   const setKeyAt = (i, value) => setGeminiKeys((prev) => { const next = [...prev]; next[i] = value; return next; });
 
   return (
     <div className="bq-settings-layout">
       <div className="bq-settings-card">
-        <h2><Key size={15} /> Gemini API keys</h2>
-        <p className="bq-muted-sm">Map up to 3 of your own free Gemini keys to "Gemini AI 1/2/3" — pick one from the Courts tab, and switch to another if one hits its rate limit. Get a free key at aistudio.google.com. Keys are stored only in this browser's local storage on this device.</p>
+        <h2><Key size={15} /> Gemini API keys <InfoTip text={'Map up to 3 of your own free Gemini keys to "Gemini AI 1/2/3", then pick which one is active below — switch to another if one hits its rate limit. Get a free key at aistudio.google.com. Keys are stored only in this browser\'s local storage on this device.'} /></h2>
+        <label className="bq-settings-field">
+          <span>Active key</span>
+          <select className="bq-select" style={{ width: "100%" }} value={geminiKeyIndex} onChange={(e) => setGeminiKeyIndex(Number(e.target.value))}>
+            {[0, 1, 2].map((i) => (
+              <option key={i} value={i}>Gemini AI {i + 1}{(geminiKeys[i] || "").trim() ? "" : " (not set)"}</option>
+            ))}
+          </select>
+        </label>
         {[0, 1, 2].map((i) => (
           <label key={i} className="bq-settings-field">
             <span>Gemini AI {i + 1}</span>
@@ -1792,13 +2132,18 @@ function Styles({ fontFamily }) {
 
       .bq-courts-layout { display: grid; grid-template-columns: 1fr 340px; gap: 20px; align-items: start; }
       @media (max-width: 880px) { .bq-courts-layout { grid-template-columns: 1fr; } }
+      .bq-courts-col { min-width: 0; }
       .bq-section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
       .bq-section-head h2 { font-family: 'Oswald'; font-size: 16px; text-transform: uppercase; letter-spacing: 0.03em; color: ${COLORS.accent}; margin: 0; }
 
       .bq-generate-bar { background: ${COLORS.card}; border: 1px solid #E7E2D3; border-radius: 14px; padding: 14px; display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
       .bq-tooltip-wrap { position: relative; display: inline-flex; }
-      .bq-tooltip-bubble { position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%); background: ${COLORS.courtDark}; color: ${COLORS.cream}; font-size: 12px; font-weight: 600; padding: 6px 10px; border-radius: 6px; white-space: nowrap; z-index: 40; pointer-events: none; }
-      .bq-tooltip-bubble::after { content: ""; position: absolute; top: 100%; left: 50%; transform: translateX(-50%); border: 5px solid transparent; border-top-color: ${COLORS.courtDark}; }
+      .bq-tooltip-bubble { position: absolute; bottom: calc(100% + 8px); left: 0; background: ${COLORS.courtDark}; color: ${COLORS.cream}; font-size: 12px; font-weight: 600; padding: 6px 10px; border-radius: 6px; white-space: nowrap; z-index: 40; pointer-events: none; }
+      .bq-tooltip-bubble::after { content: ""; position: absolute; top: 100%; left: 14px; border: 5px solid transparent; border-top-color: ${COLORS.courtDark}; }
+      .bq-infotip-wrap { position: relative; display: inline-flex; }
+      .bq-infotip-btn { background: none; border: none; color: ${COLORS.muted}; cursor: pointer; padding: 2px; display: inline-flex; border-radius: 50%; }
+      .bq-infotip-btn:hover { color: ${COLORS.accent}; background: ${COLORS.cream}; }
+      .bq-infotip-bubble { position: absolute; top: calc(100% + 6px); left: 0; background: ${COLORS.courtDark}; color: ${COLORS.cream}; font-size: 11.5px; font-weight: 500; line-height: 1.4; padding: 9px 11px; border-radius: 8px; width: 220px; white-space: normal; z-index: 45; box-shadow: 0 8px 20px rgba(0,0,0,0.2); }
       .bq-chip-row { display: flex; gap: 6px; flex-wrap: wrap; }
       .bq-chip { font-size: 11.5px; font-weight: 700; padding: 5px 10px; border-radius: 20px; border: 1px solid #DDD6C2; background: ${COLORS.cream}; color: ${COLORS.muted}; cursor: pointer; }
       .bq-chip-active { background: ${COLORS.accent}; color: ${COLORS.cream}; border-color: ${COLORS.accent}; }
@@ -1840,6 +2185,9 @@ function Styles({ fontFamily }) {
       .bq-checkbox-row { display: flex; align-items: center; gap: 7px; font-size: 11.5px; font-weight: 600; color: ${COLORS.muted}; margin-bottom: 10px; cursor: pointer; padding: 5px 8px; border-radius: 8px; background: ${COLORS.cream}; width: fit-content; }
       .bq-checkbox-row input { accent-color: ${COLORS.accent}; width: 14px; height: 14px; cursor: pointer; }
       .bq-checkbox-row-active { background: #FBEEDD; color: #A9631C; }
+      .bq-paid-check input { accent-color: ${COLORS.accent}; width: 16px; height: 16px; cursor: pointer; }
+      .bq-pay-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 14px; padding-top: 12px; border-top: 1px solid #E7E2D3; flex-wrap: wrap; }
+      .bq-link-btn { background: none; border: none; color: ${COLORS.accent}; font-size: 12.5px; font-weight: 700; text-decoration: underline; cursor: pointer; padding: 4px 0; }
 
       .bq-match { z-index: 1; display: flex; flex-direction: column; gap: 10px; flex: 1; }
       .bq-category-chip { display: inline-block; align-self: flex-start; font-size: 10.5px; font-weight: 700; padding: 3px 9px; border-radius: 20px; border: 1px solid; text-transform: uppercase; letter-spacing: 0.02em; }
@@ -1874,6 +2222,12 @@ function Styles({ fontFamily }) {
       .bq-add-form h2 { font-family: 'Oswald'; font-size: 15px; text-transform: uppercase; color: ${COLORS.accent}; margin: 0 0 2px; }
       .bq-form-row { display: flex; gap: 8px; }
       .bq-input, .bq-select { font-family: ${fontFamily}; font-size: 13px; padding: 8px 10px; border: 1px solid #DDD6C2; border-radius: 8px; background: ${COLORS.cream}; color: ${COLORS.ink}; }
+      /* Mobile browsers (iOS Safari especially) auto-zoom the page when a focused input's
+         font-size is under 16px. This override only applies below the phone breakpoint, so
+         desktop/tablet keep their normal compact sizing. */
+      @media (max-width: 600px) {
+        .bq-root input, .bq-root select, .bq-root textarea { font-size: 16px !important; }
+      }
       .bq-input:focus, .bq-select:focus { outline: 2px solid ${COLORS.accent}; outline-offset: 1px; }
       .bq-input-inline { flex: 1; min-width: 0; }
       .bq-roster h2 { font-family: 'Oswald'; font-size: 16px; text-transform: uppercase; color: ${COLORS.accent}; margin-bottom: 10px; }
@@ -1899,17 +2253,23 @@ function Styles({ fontFamily }) {
 
       .bq-history h2 { font-family: 'Oswald'; font-size: 16px; text-transform: uppercase; color: ${COLORS.accent}; margin-bottom: 10px; }
       .bq-history-list { display: flex; flex-direction: column; gap: 8px; }
-      .bq-history-row { display: flex; align-items: center; gap: 12px; background: ${COLORS.card}; border: 1px solid #E7E2D3; padding: 10px 12px; border-radius: 12px; flex-wrap: wrap; font-size: 12.5px; }
-      .bq-history-time { font-family: 'IBM Plex Mono'; color: ${COLORS.muted}; width: 56px; }
-      .bq-history-court { font-weight: 700; width: 66px; }
-      .bq-history-teams { display: flex; align-items: center; gap: 8px; font-weight: 600; flex: 1; flex-wrap: wrap; }
+      .bq-history-card { display: flex; flex-direction: column; gap: 6px; background: ${COLORS.card}; border: 1px solid #E7E2D3; padding: 10px 12px; border-radius: 12px; font-size: 12.5px; }
+      .bq-history-row1 { display: flex; align-items: center; gap: 10px; }
+      .bq-history-row2, .bq-history-row3 { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-weight: 600; }
+      .bq-history-time { font-family: 'IBM Plex Mono'; color: ${COLORS.muted}; flex-shrink: 0; }
+      .bq-history-court { font-weight: 700; flex-shrink: 0; }
+      .bq-history-team-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .bq-history-delete { margin-left: auto; }
+      .bq-shuttle-toggle { background: none; border: none; padding: 0; margin: 0; font-size: 15px; line-height: 1; cursor: pointer; }
       .bq-score-input { width: 40px; text-align: center; font-family: 'IBM Plex Mono'; font-size: 12.5px; font-weight: 700; padding: 4px 2px; border: 1px solid #DDD6C2; border-radius: 6px; background: ${COLORS.cream}; color: ${COLORS.ink}; }
       .bq-score-input:focus { outline: 2px solid ${COLORS.accent}; outline-offset: 1px; }
 
       .bq-payment { display: grid; grid-template-columns: 280px 1fr; gap: 20px; align-items: start; }
       @media (max-width: 820px) { .bq-payment { grid-template-columns: 1fr; } }
-      .bq-payment-settings, .bq-pay-table-wrap { background: ${COLORS.card}; border: 1px solid #E7E2D3; border-radius: 14px; padding: 16px; }
+      .bq-payment-settings, .bq-pay-table-wrap { background: ${COLORS.card}; border: 1px solid #E7E2D3; border-radius: 14px; padding: 16px; min-width: 0; }
       .bq-payment-settings h2, .bq-pay-table-wrap h2 { font-family: 'Oswald'; font-size: 15px; text-transform: uppercase; color: ${COLORS.accent}; margin: 0 0 12px; }
+      .bq-pay-heading-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+      .bq-pay-heading-row h2 { margin-bottom: 0; }
       .bq-pay-table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
       .bq-pay-table { min-width: 480px; }
       .bq-pay-settings-grid { display: flex; flex-direction: column; gap: 14px; }
@@ -1917,6 +2277,7 @@ function Styles({ fontFamily }) {
       .bq-pay-field > span { font-size: 12px; font-weight: 700; color: ${COLORS.ink}; }
       .bq-pay-field small { line-height: 1.4; }
       .bq-pay-input-wrap { display: flex; align-items: center; gap: 6px; }
+      .bq-pay-input-wrap input { flex: 1; min-width: 0; }
       .bq-pay-input-wrap > span { font-weight: 700; color: ${COLORS.muted}; }
       .bq-pay-input-wrap .bq-input { flex: 1; }
       .bq-payment-settings > p { margin-top: 14px; padding-top: 12px; border-top: 1px solid #E7E2D3; }
