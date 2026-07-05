@@ -926,6 +926,18 @@ function App() {
     setPendingMatches((prev) => prev.filter((m) => m.id !== matchId));
     notify(`Match sent to ${court.label}.`, "success");
   };
+  // Build Manually's "Start now" button: takes a freshly-built match object directly (never
+  // routes it through pendingMatches first), so there's no stale-state lookup to fail. This is
+  // what the old two-step add-then-send version got wrong.
+  const startManualMatchNow = (m, courtId) => {
+    const court = courts.find((c) => c.id === courtId);
+    if (!isCompleteMatch(m) || !court || court.match) { notify("That court isn't free.", "warn"); return; }
+    setCourts((prev) => prev.map((c) => (c.id === courtId
+      ? { ...c, match: { teamA: m.teamA.map((p) => p.id), teamB: m.teamB.map((p) => p.id), category: m.category, startedAt: Date.now() } }
+      : c)));
+    consumeFromQueueAndResetStreak(new Set(m.players.map((p) => p.id)));
+    notify(`Match sent to ${court.label}.`, "success");
+  };
   const sendToFirstOpenCourt = (matchId) => {
     const open = courts.find((c) => !c.match);
     if (!open) { notify("No court is free yet — finish a match first.", "warn"); return; }
@@ -1164,12 +1176,7 @@ Respond with ONLY raw JSON, no markdown fences, no commentary, in exactly this s
           queue={queue} playersById={playersById} courts={courts}
           onClose={() => setManualOpen(false)}
           onAddPending={(m) => { addPendingMatches([m], "Manual"); consumeFromQueueAndResetStreak(new Set(m.players.map((p) => p.id))); setManualOpen(false); }}
-          onStartNow={(m, courtId) => {
-            const built = addPendingMatches([m], "Manual")[0];
-            consumeFromQueueAndResetStreak(new Set(m.players.map((p) => p.id)));
-            sendPendingToCourt(built.id, courtId);
-            setManualOpen(false);
-          }}
+          onStartNow={(m, courtId) => { startManualMatchNow(m, courtId); setManualOpen(false); }}
         />
       )}
 
@@ -1488,8 +1495,10 @@ function SwapPicker({ originId, originMatchId, originTeam, originIdx, pendingMat
     return (
       <button key={`${item.matchId || "pool"}-${item.id}`} className="bq-swap-candidate" onClick={() => onPick(item)}>
         <Avatar name={p.name} size={22} />
-        <span className="bq-swap-candidate-name">{p.name}</span>
-        <LevelBadge level={p.level} abbreviate />
+        <div className="bq-swap-candidate-info">
+          <span className="bq-swap-candidate-name">{p.name}</span>
+          <LevelBadge level={p.level} abbreviate />
+        </div>
       </button>
     );
   };
@@ -1590,7 +1599,12 @@ function ManualMatchModal({ queue, playersById, courts, onClose, onAddPending, o
           <div className="bq-manual-grid">
             {queuePlayers.map((p) => (
               <button key={p.id} className={`bq-manual-pick ${manualIds.includes(p.id) ? "bq-manual-pick-active" : ""}`} onClick={() => toggle(p.id)}>
-                <Avatar name={p.name} size={26} /><span>{p.name}</span><LevelBadge level={p.level} /><GenderDot gender={p.gender} />
+                <Avatar name={p.name} size={26} />
+                <div className="bq-manual-pick-info">
+                  <span className="bq-manual-pick-name">{p.name}</span>
+                  <LevelBadge level={p.level} />
+                </div>
+                <GenderDot gender={p.gender} />
               </button>
             ))}
           </div>
@@ -2245,7 +2259,8 @@ function Styles({ fontFamily }) {
       .bq-swap-section-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: ${COLORS.muted}; padding: 2px 4px; }
       .bq-swap-candidate { display: flex; align-items: center; gap: 6px; width: 100%; background: none; border: none; padding: 5px 4px; border-radius: 6px; cursor: pointer; text-align: left; }
       .bq-swap-candidate:hover { background: ${COLORS.cream}; }
-      .bq-swap-candidate-name { flex: 1; font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .bq-swap-candidate-info { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
+      .bq-swap-candidate-name { font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
       .bq-court-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
       .bq-court-card { position: relative; background: ${COLORS.card}; border-radius: 14px; padding: 14px; border: 1px solid #E7E2D3; overflow: hidden; min-height: 190px; display: flex; flex-direction: column; }
@@ -2319,9 +2334,10 @@ function Styles({ fontFamily }) {
       .bq-modal-body { padding: 14px 18px 18px; }
       .bq-suggestion { background: ${COLORS.card}; border: 1px solid #E7E2D3; border-radius: 12px; padding: 14px; margin-top: 10px; }
       .bq-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
-      .bq-manual-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; margin-top: 10px; max-height: 240px; overflow-y: auto; }
+      .bq-manual-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 6px; margin-top: 10px; max-height: 240px; overflow-y: auto; }
       .bq-manual-pick { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border: 1px solid #DDD6C2; background: ${COLORS.card}; border-radius: 9px; cursor: pointer; font-size: 12px; font-weight: 600; text-align: left; }
-      .bq-manual-pick span:nth-child(2) { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .bq-manual-pick-info { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
+      .bq-manual-pick-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .bq-manual-pick-active { border-color: ${COLORS.accent}; background: #E9F0EA; }
 
       .bq-history h2 { font-family: 'Oswald'; font-size: 16px; text-transform: uppercase; color: ${COLORS.accent}; margin-bottom: 10px; }
